@@ -2001,6 +2001,126 @@ out:
 	return err;
 }
 
+/*
+ * Move a regular file's inline data to block 0 through the page cache, as a
+ * buffered write does, so the data reaches the disk by writeback.  It must not
+ * be journalled as a metadata block: checkpointing that copy later would
+ * overwrite whatever the file has written to the block since.
+ */
+static int ext4_convert_inline_data_reg(struct inode *inode)
+{
+	struct address_space *mapping = inode->i_mapping;
+	int ret, ret2, needed_blocks, no_expand, retries = 0;
+	unsigned int inline_size, len;
+	struct buffer_head *bh;
+	struct ext4_iloc iloc;
+	struct folio *folio;
+	handle_t *handle;
+	void *buf;
+
+	/* In data=ordered mode ext4_map_blocks() files the new block here. */
+	ret = ext4_inode_attach_jinode(inode);
+	if (ret)
+		return ret;
+
+	needed_blocks = ext4_chunk_trans_extent(inode, 1);
+
+	ret = ext4_get_inode_loc(inode, &iloc);
+	if (ret)
+		return ret;
+
+retry:
+	buf = NULL;
+	handle = ext4_journal_start(inode, EXT4_HT_WRITE_PAGE, needed_blocks);
+	if (IS_ERR(handle)) {
+		ret = PTR_ERR(handle);
+		goto out_brelse;
+	}
+
+	folio = __filemap_get_folio(mapping, 0, FGP_WRITEBEGIN | FGP_NOFS,
+				    mapping_gfp_mask(mapping));
+	if (IS_ERR(folio)) {
+		ret = PTR_ERR(folio);
+		goto out_stop;
+	}
+
+	ext4_write_lock_xattr(inode, &no_expand);
+	ret = 0;
+	if (!ext4_has_inline_data(inode))
+		goto out_unlock;
+
+	inline_size = ext4_get_inline_size(inode);
+	len = min_t(loff_t, inline_size, i_size_read(inode));
+	if (len > i_blocksize(inode)) {
+		EXT4_ERROR_INODE(inode, "inline data size %u exceeds block size",
+				 len);
+		ret = -EFSCORRUPTED;
+		goto out_unlock;
+	}
+
+	ext4_fc_track_inode(handle, inode);
+	if (!len) {
+		ret = ext4_destroy_inline_data_nolock(handle, inode);
+		goto out_unlock;
+	}
+
+	buf = kmalloc(inline_size, GFP_NOFS);
+	if (!buf) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+	ret = ext4_read_inline_data(inode, buf, inline_size, &iloc);
+	if (ret < 0)
+		goto out_unlock;
+
+	if (!folio_test_uptodate(folio)) {
+		ret = ext4_read_inline_folio(inode, folio);
+		if (ret < 0)
+			goto out_unlock;
+	}
+
+	ret = ext4_destroy_inline_data_nolock(handle, inode);
+	if (ret)
+		goto out_unlock;
+
+	/*
+	 * A written extent, not an unwritten one: in data=ordered mode the
+	 * commit that drops the inline copy then waits for the data.
+	 */
+	ret = ext4_block_write_begin(handle, folio, 0, len, ext4_get_block);
+	if (ret) {
+		ext4_restore_inline_data(handle, inode, &iloc, buf, inline_size);
+		goto out_unlock;
+	}
+
+	bh = folio_buffers(folio);
+	clear_buffer_new(bh);
+	if (ext4_should_journal_data(inode)) {
+		ret = do_journal_get_write_access(handle, inode, bh);
+		if (!ret) {
+			folio_mark_dirty(folio);
+			ret = ext4_handle_dirty_metadata(handle, NULL, bh);
+		}
+	} else {
+		block_commit_write(folio, 0, len);
+	}
+
+out_unlock:
+	ext4_write_unlock_xattr(inode, &no_expand);
+	folio_unlock(folio);
+	folio_put(folio);
+out_stop:
+	ret2 = ext4_journal_stop(handle);
+	if (!ret)
+		ret = ret2;
+	kfree(buf);
+	if (ret == -ENOSPC && ext4_should_retry_alloc(inode->i_sb, &retries))
+		goto retry;
+out_brelse:
+	brelse(iloc.bh);
+	return ret;
+}
+
 int ext4_convert_inline_data(struct inode *inode)
 {
 	int error, needed_blocks, no_expand;
@@ -2023,6 +2143,9 @@ int ext4_convert_inline_data(struct inode *inode)
 		if (!ext4_has_inline_data(inode))
 			return 0;
 	}
+
+	if (S_ISREG(inode->i_mode))
+		return ext4_convert_inline_data_reg(inode);
 
 	needed_blocks = ext4_chunk_trans_extent(inode, 1);
 
